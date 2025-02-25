@@ -1,0 +1,9 @@
+{
+    "domain": "mako_preprocessor",
+    "name": "Mako Preprocessor",
+    "documentation": "https://github.com/tevvi/mako_preprocessor",
+    "dependencies": [],
+    "codeowners": ["@tevvi"],
+    "requirements": ["mako", "PyYAML", "watchdog"],
+    "version": "1.0.0"
+}

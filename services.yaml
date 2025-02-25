@@ -1,0 +1,35 @@
+run_preprocessor:
+  name: Run mako preprocessor
+  description: Run mako preprocessor
+  fields:
+    directories:
+      name: Directories
+      description: Directories to find and preprocess files
+      example:
+        - "/config"
+    render_extensions:
+      name: Render extensions
+      description: Extensions for render feature
+      example:
+        - ".mako"
+    serialize_extensions:
+      name: Serialize extensions
+      description: Extensions for serialize feature
+      example:
+        - ".mako"
+    overwrite_modified_files:
+      name: Overwrite modified files
+      description: If true, all handmade edited files will be overrided. If false all files edited by user will be ignored
+      example: True
+    run_on_start_ha:
+      name: Run preprocessor on start home assistant
+      description: If true, preprocessor will be ran on start home assitant. If false, preprocessor will not be ran on start home assistant
+      example: True
+
+view_metadata:
+  name: View metadata
+  description: View all metadata stored by the preprocessor
+
+clear_metadata:
+  name: Clear metadata
+  description: Clear all metadata stored by the preprocessor
