@@ -1,0 +1,8 @@
+{
+    "name": "Mako Preprocessor",
+    "content_in_root": false,
+    "domain": "mako_preprocessor",
+    "domain_path": "custom_components/mako_preprocessor",
+    "file_type": "integration",
+    "render_readme": true
+  }
