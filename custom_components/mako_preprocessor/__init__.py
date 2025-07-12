@@ -43,9 +43,13 @@ CONFIG_SCHEMA = vol.Schema(
                         cv.positive_int,
                         vol.Range(min=1, max=3600)
                     ),
-                    vol.Optional("reload_frequency_secs", default=5): vol.All(
-                        cv.positive_int,
-                        vol.Range(min=1, max=3600)
+                    vol.Optional("reload_wait_min_secs", default=1): vol.All(
+                        cv.positive_int, 
+                        vol.Range(min=0, max=3600)
+                    ),
+                    vol.Optional("reload_wait_max_secs"): vol.Any(
+                        vol.All(cv.positive_int, vol.Range(min=0, max=3600)),
+                        None
                     ),
                     vol.Optional("batch_size", default=50): vol.All(
                         cv.positive_int,

@@ -134,11 +134,11 @@ class PreprocessorWorker:
                     with self.Lock.acquire():
                         self.template_renderer.process_batch(list(batch_files))
                         self.reload_pending = True
-
-            except Empty:
-                if not batch_files and self.render_queue.empty() and self.scheduled_files.empty() and self.reload_pending:
+                
+                if self.render_queue.empty() and self.scheduled_files.empty() and self.reload_pending:
                     self.reload_worker.request_reload()
                     self.reload_pending = False
+            except Empty:
                 continue
             except Exception as e:
                 _LOGGER.error(f"MAKO-015 Error in preprocessor worker: {e}\n{traceback.format_exc()}")

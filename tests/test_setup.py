@@ -1,54 +1,1170 @@
 import os
+import sys
+import time
 import shutil
 import tempfile
 import unittest
-from unittest.mock import patch, MagicMock
+import asyncio
+import logging
+from io import StringIO
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
 
-# Mock HomeAssistant to avoid ModuleNotFoundError
-class HomeAssistant:
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from custom_components.mako_preprocessor.run_config import RunConfig
+from custom_components.mako_preprocessor import setup, DOMAIN
+from custom_components.mako_preprocessor.metadata import MetadataManager
+from custom_components.mako_preprocessor.template_renderer import TemplateRenderer
+
+@contextmanager
+def suppress_logs():
+    """Temporarily suppress logging output during tests."""
+    logger = logging.getLogger()
+    old_handlers = logger.handlers[:]
+    old_level = logger.level
+    
+    # Create a string buffer and handler
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(logging.DEBUG)  # Set to capture all logs
+    logger.handlers = [handler]
+    logger.setLevel(logging.DEBUG)
+    
+    try:
+        yield stream
+    finally:
+        # Restore original handlers and level
+        logger.handlers = old_handlers
+        logger.level = old_level
+
+class TestTimer:
     def __init__(self):
-        self.services = MagicMock()
+        self.test_times = {}
+        self.start_time = None
+        self.total_time = 0
 
-# Import the real setup function
-from ...mako_preprocessor import setup, DOMAIN
+    def startTest(self, test):
+        self.start_time = time.time()
+
+    def stopTest(self, test):
+        if self.start_time:
+            elapsed = time.time() - self.start_time
+            test_name = test._testMethodName
+            self.test_times[test_name] = elapsed
+            self.total_time += elapsed
+
+    def getReport(self):
+        if not self.test_times:
+            return "No tests were run."
+        
+        # Sort tests by execution time (descending)
+        sorted_tests = sorted(self.test_times.items(), key=lambda x: x[1], reverse=True)
+        
+        # Get top 5 slowest tests
+        top_5_slowest = sorted_tests[:5]
+        
+        # Format report
+        report = [f"\nTotal time: {self.total_time:.3f}s", "Top 5 slowest tests:"]
+        
+        # Find maximum width for time and percentage fields
+        max_time_width = max(len(f"{time:.3f}") for _, time in top_5_slowest)
+        max_pct_width = max(len(f"{(time / self.total_time) * 100:.1f}") for _, time in top_5_slowest)
+        
+        for i, (test_name, time) in enumerate(top_5_slowest, 1):
+            percentage = (time / self.total_time) * 100
+            report.append(f"{i}. [{time:>{max_time_width}.3f}s, {percentage:>{max_pct_width}.1f}%] {test_name}")
+            
+        return "\n".join(report)
 
 class TestSetup(unittest.TestCase):
-    def setUp(self):
-        self.hass = HomeAssistant()
-        self.temp_dir = tempfile.mkdtemp()
-        self.test_mako_file = os.path.join(self.temp_dir, "test.yaml.mako")
-        self.test_output_file = os.path.join(self.temp_dir, "test.yaml")
+    @classmethod
+    def setUpClass(cls):
+        cls.timer = TestTimer()
         
+    def setUp(self):
+        self.timer.startTest(self)
+        # Initialize metadata
+        self.meta_dir = tempfile.mkdtemp()
+        self.temp_meta_file = os.path.join(self.meta_dir, '.mako_meta.json')
+        self.meta_patcher = patch('custom_components.mako_preprocessor.metadata.META_FILE', self.temp_meta_file)
+        self.meta_patcher.start()
+        MetadataManager()._initialize()
+
+        # Initialize mako_preprocessor
+        self.directories = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.directories, ignore_errors=True))
+        self.config = {
+            "directories": [self.directories],
+            "render_extensions": [".mako"],
+            "serialize_extensions": [".serialize"],
+            "enable_features": ["render", "template", "serialize"],
+            "overwrite_modified_files": False,
+            "backup_enabled": False,
+            "run_on_start_ha": True,
+            "hot_reload": False,
+            "reload_behavior": "none",
+            "batch_size": 1,
+            "reload_wait_min_secs": 1,
+            "reload_wait_max_secs": 5,
+            "hot_reload_delay_secs": 1,
+        }
+        
+        self.hass = MagicMock()
+        self.hass.data = {}
+
+        # Prepare test files
+        self.test_mako_file = os.path.join(self.directories, "test.yaml.mako")
+        self.test_output_file = os.path.join(self.directories, "test.yaml")
+
         with open(self.test_mako_file, "w") as f:
             f.write("key: value")
 
-        self.config = {
-            DOMAIN: {
-                "directories": [self.temp_dir],
-                "render_extensions": [".mako"],
-                "run_on_start_ha": True,
-                "hot_reload": False,
-                "reload_behavior": "none",
-                "batch_size": 1,
-                "reload_frequency_secs": 1,
-                "hot_reload_delay_secs": 1,
-            }
-        }
-
     def tearDown(self):
-        shutil.rmtree(self.temp_dir)
+        self.meta_patcher.stop()
+        # Clean up both metadata file and its directory
+        if os.path.exists(self.meta_dir): 
+            shutil.rmtree(self.meta_dir, ignore_errors=True)
+        
+        self.timer.stopTest(self)
 
-    @patch("mako_preprocessor.RunPreprocessor.run")
-    def test_setup_generates_file(self, mock_run):
-        mock_run.side_effect = self._mock_run_preprocessor
-        setup(self.hass, self.config)
-        self.assertTrue(os.path.exists(self.test_output_file))
+    def _validate_template_output(self, expected_content = "key: value"):
+        """Validates the template output format"""
+
+        content = None
         with open(self.test_output_file, "r") as f:
-            content = f.read()
-        self.assertEqual(content, "key: value")
+                content = f.read()
+        lines = content.split('\n')
+        
+        # Basic structure checks
+        self.assertTrue(lines[0].startswith('# Generated by: mako_preprocessor'))
+        self.assertEqual(lines[1], expected_content)
+        self.assertEqual(lines[2], '# Rendered with:')
+        
+        # Check metadata sections exist
+        metadata_text = '\n'.join(lines[2:])
+        self.assertIn('#   variables:', metadata_text)
+        self.assertIn('#   processed from:', metadata_text)
+        self.assertIn('#   timestamp:', metadata_text)
+        self.assertIn('#   version:', metadata_text)
+        self.assertIn('#   metadata_version:', metadata_text)
 
-    def _mock_run_preprocessor(self):
-        shutil.copyfile(self.test_mako_file, self.test_output_file)
+    def test_setup_generates_file(self):
+        with suppress_logs():
+            # Create and get event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                self.assertTrue(os.path.exists(self.test_output_file))
+                self._validate_template_output()
+                
+            finally:
+                loop.close()
+
+    def test_setup_does_not_overwrite_existing(self):
+        with suppress_logs():
+            # Create and get event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Create initial output file with known content
+                initial_content = "existing: content"
+                with open(self.test_output_file, "w") as f:
+                    f.write(initial_content)
+                
+                # Get file modification time
+                initial_mtime = os.path.getmtime(self.test_output_file)
+                
+                # Run setup with overwrite_modified_files=False
+                self.config["overwrite_modified_files"] = False
+                
+                # Small delay to allow async operations to complete
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Check file still exists and content hasn't changed
+                self.assertTrue(os.path.exists(self.test_output_file))
+                with open(self.test_output_file, "r") as f:
+                    content = f.read()
+                
+                self.assertEqual(content, initial_content)
+                self.assertEqual(os.path.getmtime(self.test_output_file), initial_mtime)
+                
+            finally:
+                loop.close()
+
+    def test_no_backup_when_not_overwriting(self):
+        with suppress_logs():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                backup_dir = tempfile.mkdtemp()
+                self.addCleanup(lambda: shutil.rmtree(backup_dir, ignore_errors=True))
+
+                # Create initial output file with known content
+                initial_content = "existing: content"
+                with open(self.test_output_file, "w") as f:
+                    f.write(initial_content)
+                
+                initial_mtime = os.path.getmtime(self.test_output_file)
+                
+                # Configure backup but disable overwrite
+                self.config["backup_enabled"] = True
+                self.config["backup_directory"] = backup_dir
+                self.config["overwrite_modified_files"] = False
+                
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Verify original file remains unchanged
+                self.assertTrue(os.path.exists(self.test_output_file))
+                self.assertEqual(os.path.getmtime(self.test_output_file), initial_mtime)
+                with open(self.test_output_file, "r") as f:
+                    content = f.read()
+                self.assertEqual(content, initial_content)
+                
+                # Verify backup directory is empty
+                self.assertEqual(len(os.listdir(backup_dir)), 0)
+                
+            finally:
+                loop.close()
+
+    def test_no_backup_for_previously_generated_files(self):
+        with suppress_logs():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Setup backup directory
+                backup_dir = tempfile.mkdtemp()
+                self.addCleanup(lambda: shutil.rmtree(backup_dir, ignore_errors=True))
+
+                # First run to generate initial file
+                self.config["overwrite_modified_files"] = True
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+
+                with open(self.test_mako_file, "w") as f:
+                    f.write("modified: content")
+
+                # Configure backup and run again
+                self.config["backup_enabled"] = True
+                self.config["backup_directory"] = backup_dir
+                self.config["overwrite_modified_files"] = True
+                
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Verify file was overwritten but not backed up
+                self.assertTrue(os.path.exists(self.test_output_file))
+                self._validate_template_output("modified: content")
+                
+                # Verify backup directory is empty (no backup was made)
+                self.assertEqual(len(os.listdir(backup_dir)), 0)
+                
+            finally:
+                loop.close()
+
+    def test_overwrites_when_mako_modified_after_generation(self):
+        with suppress_logs():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # First run to generate initial file
+                self.config["overwrite_modified_files"] = True
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Store initial yaml timestamp and content
+                initial_yaml_mtime = os.path.getmtime(self.test_output_file)
+                with open(self.test_output_file, "r") as f:
+                    initial_content = f.read()
+                
+                # Wait a moment to ensure file timestamps will be different
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Modify the mako file
+                new_content = "modified: new_value"
+                with open(self.test_mako_file, "w") as f:
+                    f.write(new_content)
+                
+                # Run setup again
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Verify file was overwritten
+                self.assertTrue(os.path.exists(self.test_output_file))
+                self.assertGreater(os.path.getmtime(self.test_output_file), initial_yaml_mtime)
+                self._validate_template_output("modified: new_value")
+                
+            finally:
+                loop.close()
+
+    def test_overwrites_when_metadata_corrupted(self):
+        with suppress_logs() as log_stream:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # First run to generate initial file
+                self.config["overwrite_modified_files"] = True
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Store initial yaml timestamp
+                initial_yaml_mtime = os.path.getmtime(self.test_output_file)
+                
+                # Wait a moment to ensure file timestamps will be different
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Corrupt the metadata file with invalid JSON
+                with open(self.temp_meta_file, "w") as f:
+                    f.write("{invalid json")
+                
+                # Force metadata manager to reinitialize
+                MetadataManager()._initialize()
+                
+                # Run setup again with overwrite enabled
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Verify warning message about corrupted metadata
+                log_output = log_stream.getvalue()
+                self.assertIn("⚠️ Metadata file is corrupted", log_output)
+                
+                # Verify file was regenerated
+                self.assertTrue(os.path.exists(self.test_output_file))
+                self.assertGreater(os.path.getmtime(self.test_output_file), initial_yaml_mtime)
+                self._validate_template_output()
+                
+            finally:
+                loop.close()
+
+    def test_setup_overwrites_existing_when_enabled(self):
+        with suppress_logs():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Create initial output file with known content
+                initial_content = "existing: content"
+                with open(self.test_output_file, "w") as f:
+                    f.write(initial_content)
+                
+                initial_mtime = os.path.getmtime(self.test_output_file)
+                
+                # Configure and run setup
+                self.config["overwrite_modified_files"] = True
+
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Verify changes
+                self.assertTrue(os.path.exists(self.test_output_file))
+                with open(self.test_output_file, "r") as f:
+                    content = f.read()
+                
+                self.assertNotEqual(content, initial_content)
+                self.assertGreater(os.path.getmtime(self.test_output_file), initial_mtime)
+                self._validate_template_output()
+                
+            finally:
+                loop.close()
+
+    def test_backup_user_generated_file(self):
+        with suppress_logs():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Setup backup directory
+                backup_dir = tempfile.mkdtemp()
+                self.addCleanup(lambda: shutil.rmtree(backup_dir, ignore_errors=True))
+
+                # Create user-generated yaml file
+                user_content = "user: generated\ncontent: here"
+                with open(self.test_output_file, "w") as f:
+                    f.write(user_content)
+
+                # Configure backup and overwrite
+                self.config["backup_enabled"] = True
+                self.config["backup_directory"] = backup_dir
+                self.config["overwrite_modified_files"] = True
+                
+                # Run setup
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Verify backup was created
+                backup_files = os.listdir(backup_dir)
+                self.assertEqual(len(backup_files), 1)
+                
+                # Verify backup content
+                backup_path = os.path.join(backup_dir, backup_files[0])
+                with open(backup_path, "r") as f:
+                    backup_content = f.read()
+                self.assertEqual(backup_content, user_content)
+                
+                # Verify new file was generated
+                self.assertTrue(os.path.exists(self.test_output_file))
+                self._validate_template_output()
+                
+            finally:
+                loop.close()
+
+    def test_no_backup_when_backup_disabled(self):
+        with suppress_logs():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Setup backup directory (should remain empty)
+                backup_dir = tempfile.mkdtemp()
+                self.addCleanup(lambda: shutil.rmtree(backup_dir, ignore_errors=True))
+
+                # Create user-generated yaml file
+                user_content = "user: generated\ncontent: here"
+                with open(self.test_output_file, "w") as f:
+                    f.write(user_content)
+
+                # Configure with backup disabled but overwrite enabled
+                self.config["backup_enabled"] = False
+                self.config["backup_directory"] = backup_dir
+                self.config["overwrite_modified_files"] = True
+                
+                # Run setup
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Verify backup directory is empty
+                self.assertEqual(len(os.listdir(backup_dir)), 0)
+                
+                # Verify file was overwritten
+                self.assertTrue(os.path.exists(self.test_output_file))
+                self._validate_template_output()
+                
+            finally:
+                loop.close()
+
+    def test_no_overwrite_when_mako_has_error(self):
+        with suppress_logs() as log_stream:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Create user-generated yaml file
+                user_content = "user: generated\ncontent: here"
+                with open(self.test_output_file, "w") as f:
+                    f.write(user_content)
+                
+                initial_mtime = os.path.getmtime(self.test_output_file)
+
+                # Create mako file with syntax error
+                with open(self.test_mako_file, "w") as f:
+                    f.write("${invalid syntax")
+
+                # Configure with overwrite enabled
+                self.config["overwrite_modified_files"] = True
+                
+                # Run setup
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Verify original file was not modified
+                self.assertTrue(os.path.exists(self.test_output_file))
+                self.assertEqual(os.path.getmtime(self.test_output_file), initial_mtime)
+                
+                with open(self.test_output_file, "r") as f:
+                    content = f.read()
+                self.assertEqual(content, user_content)
+                
+            finally:
+                loop.close()
+
+    def test_no_backup_when_mako_has_error(self):
+        with suppress_logs() as log_stream:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Setup backup directory (should remain empty)
+                backup_dir = tempfile.mkdtemp()
+                self.addCleanup(lambda: shutil.rmtree(backup_dir, ignore_errors=True))
+
+                # Create user-generated yaml file
+                user_content = "user: generated\ncontent: here"
+                with open(self.test_output_file, "w") as f:
+                    f.write(user_content)
+                
+                initial_mtime = os.path.getmtime(self.test_output_file)
+
+                # Create mako file with syntax error
+                with open(self.test_mako_file, "w") as f:
+                    f.write("${invalid syntax")
+
+                # Configure with backup and overwrite enabled
+                self.config["backup_enabled"] = True
+                self.config["backup_directory"] = backup_dir
+                self.config["overwrite_modified_files"] = True
+                
+                # Run setup
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Verify backup directory is empty
+                self.assertEqual(len(os.listdir(backup_dir)), 0)
+                
+                # Verify original file was not modified
+                self.assertTrue(os.path.exists(self.test_output_file))
+                self.assertEqual(os.path.getmtime(self.test_output_file), initial_mtime)
+                
+                with open(self.test_output_file, "r") as f:
+                    content = f.read()
+                self.assertEqual(content, user_content)
+                
+            finally:
+                loop.close()
+
+    def test_setup_renders_with_python_imports(self):
+        with suppress_logs():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Create mako file with Python imports and template logic
+                template_content = """<%
+import yaml
+from datetime import datetime
+
+data = {'timestamp': datetime.now().isoformat()}
+%>
+generated_time: ${data['timestamp']}
+% for i in range(3):
+item_${i}: value_${i}
+% endfor"""
+
+                with open(self.test_mako_file, "w") as f:
+                    f.write(template_content)
+
+                # Configure and run setup
+                self.config["overwrite_modified_files"] = True
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+
+                # Verify file was generated
+                self.assertTrue(os.path.exists(self.test_output_file))
+                
+                # Read generated content
+                with open(self.test_output_file, "r") as f:
+                    content = f.read()
+
+                # Basic validation
+                lines = content.split('\n')
+                self.assertTrue(lines[0].startswith('# Generated by: mako_preprocessor'))
+                self.assertTrue(lines[3].startswith('generated_time:'))  # Just check prefix
+                self.assertTrue('T' in lines[3])  # ISO format contains 'T' between date and time
+                self.assertEqual(lines[5], 'item_0: value_0')
+                self.assertEqual(lines[7], 'item_1: value_1')
+                self.assertEqual(lines[9], 'item_2: value_2')
+                
+            finally:
+                loop.close()
+
+    def test_setup_renders_with_template_inheritance(self):
+        with suppress_logs() as log_stream:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Create base template with .template extension
+                base_template = os.path.join(self.directories, "base.template")
+                with open(base_template, "w") as f:
+                    f.write("""<%def name="header(title='Test')">
+# ${title}
+</%def>
+
+<%def name="footer()">
+# End of document
+</%def>
+
+${self.header(title)}
+${next.body()}
+${self.footer()}""")
+
+                # Create main template with simple path
+                template_content = """<%inherit file="./base.template"/>
+<%namespace name="utils" file="./base.template"/>
+<%
+colors = ['red', 'green', 'blue']
+%>
+
+## Define a local function
+<%def name="list_item(item)">
+- ${item}
+</%def>
+
+% for color in colors:
+${list_item(color)}
+% endfor
+
+% if len(colors) > 2:
+Has many colors
+% endif
+
+## Using variables
+${'Dynamic content'}"""
+
+                with open(self.test_mako_file, "w") as f:
+                    f.write(template_content)
+
+                # Configure and run setup
+                self.config["overwrite_modified_files"] = True
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+
+                # Verify file was generated
+                self.assertTrue(os.path.exists(self.test_output_file))
+                
+                # Read generated content and print for debugging
+                with open(self.test_output_file, "r") as f:
+                    content = f.read()
+                # Basic validation of the rendered content
+                lines = content.strip().split('\n')
+                self.assertTrue(any('# Test' in line for line in lines))  # Header
+                self.assertTrue(any('- red' in line for line in lines))   # List items
+                self.assertTrue(any('- green' in line for line in lines))
+                self.assertTrue(any('- blue' in line for line in lines))
+                self.assertTrue(any('Has many colors' in line for line in lines))
+                self.assertTrue(any('Dynamic content' in line for line in lines))
+                self.assertTrue(any('# End of document' in line for line in lines))  # Footer
+            
+            finally:
+                loop.close()
+
+    def test_no_render_with_missing_constants(self):
+        with suppress_logs() as log_stream:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Create mako file that uses constants
+                template_content = """# Template using constants
+password: ${constants["test"]}
+username: admin"""
+
+                with open(self.test_mako_file, "w") as f:
+                    f.write(template_content)
+
+                # Configure and run setup
+                self.config["overwrite_modified_files"] = True
+                self.config["constants"] ={"other": "secret"}
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Verify error was logged
+                log_output = log_stream.getvalue()
+                self.assertIn("MAKO-006 ❌ Error processing", log_output)
+                self.assertIn("KeyError: 'test'", log_output)
+                
+                # Verify output file was not created
+                self.assertFalse(os.path.exists(self.test_output_file))
+                
+            finally:
+                loop.close()
+
+    def test_render_with_provided_constants(self):
+        with suppress_logs():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                template_content = """# Template using constants
+password: ${constants["test"]}
+username: admin"""
+
+                with open(self.test_mako_file, "w") as f:
+                    f.write(template_content)
+
+                # Configure secrets and run setup
+                self.config["overwrite_modified_files"] = True
+                self.config["constants"] ={"test": "secret_password"}
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Verify file was generated
+                self.assertTrue(os.path.exists(self.test_output_file))
+                
+                # Verify content
+                with open(self.test_output_file, "r") as f:
+                    content = f.read()
+                
+                # Check that secret was properly rendered
+                lines = content.split('\n')
+                self.assertTrue(any('password: secret_password' in line for line in lines))
+                self.assertTrue(any('username: admin' in line for line in lines))
+                
+            finally:
+                loop.close()
+
+    def test_setup_serialized_file(self):
+        with suppress_logs() as log_stream:  # Changed to capture logs
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Create template file
+                template_path = os.path.join(self.directories, "test.template")
+                with open(template_path, "w") as f:
+                    f.write("greeting: ${constants['prefix']} ${variables['base_message']} ${variables['message']}")
+
+                # Create serialized config file
+                serialize_path = os.path.join(self.directories, "test.yaml.serialize")
+                serialize_content = """
+template: test.template
+variables:
+  base_message: Hello
+outputs:
+  - filename: output.yaml
+    variables:
+      message: world
+"""
+                with open(serialize_path, "w") as f:
+                    f.write(serialize_content)
+
+                # Configure and run setup
+                self.config["overwrite_modified_files"] = True
+                self.config["constants"] = {"prefix": "Hi,"}
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+                
+                # Verify output file was generated
+                output_path = os.path.join(self.directories, "output.yaml")
+                self.assertTrue(os.path.exists(output_path))
+
+                # Verify content
+                with open(output_path, "r") as f:
+                    content = f.read()  
+                lines = content.split('\n')
+                self.assertTrue(any('greeting: Hi, Hello world' in line for line in lines))
+                
+            finally:
+                loop.close()
+
+    def test_no_overwrite_serialized_when_user_yaml_exists(self):
+        with suppress_logs() as log_stream:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Create template file
+                template_path = os.path.join(self.directories, "test.template")
+                with open(template_path, "w") as f:
+                    f.write("greeting: hello ${variables['name']}")
+
+                # Create serialized config file
+                serialize_path = os.path.join(self.directories, "test.yaml.serialize")
+                serialize_content = """
+template: test.template
+outputs:
+  - filename: user_file.yaml
+    variables:
+      name: world
+"""
+                with open(serialize_path, "w") as f:
+                    f.write(serialize_content)
+
+                # Create user-generated yaml file
+                user_file = os.path.join(self.directories, "user_file.yaml")
+                user_content = "user: content\nmanually: created"
+                with open(user_file, "w") as f:
+                    f.write(user_content)
+
+                initial_mtime = os.path.getmtime(user_file)
+
+                # Configure and run setup with overwrite enabled
+                self.config["overwrite_modified_files"] = True
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+
+                # Verify file was modified
+                self.assertTrue(os.path.exists(user_file))
+                self.assertGreater(os.path.getmtime(user_file), initial_mtime)
+                
+                # Verify content was changed
+                with open(user_file, "r") as f:
+                    content = f.read()
+                self.assertNotEqual(content, user_content)
+                
+                # Verify rendered content 
+                lines = content.split('\n')
+                self.assertTrue(any('greeting: hello world' in line for line in lines))
+                
+            finally:
+                loop.close()
+
+    def test_setup_multiple_serialized_outputs(self):
+        with suppress_logs():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Create template file
+                template_path = os.path.join(self.directories, "multiple.template")
+                with open(template_path, "w") as f:
+                    f.write("message: ${variables['greeting']} ${variables['name']}")
+
+                # Create serialized config file with multiple outputs
+                serialize_path = os.path.join(self.directories, "multiple.yaml.serialize")
+                serialize_content = """
+template: multiple.template
+outputs:
+  - filename: output1.yaml
+    variables:
+      greeting: Hello
+      name: world
+  - filename: output2.yaml
+    variables:
+      greeting: Hi
+      name: there
+"""
+                with open(serialize_path, "w") as f:
+                    f.write(serialize_content)
+
+                # Configure and run setup
+                self.config["overwrite_modified_files"] = True
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+
+                # Verify first output file was generated
+                output1_path = os.path.join(self.directories, "output1.yaml")
+                self.assertTrue(os.path.exists(output1_path))
+                with open(output1_path, "r") as f:
+                    content1 = f.read()
+                lines1 = content1.split('\n')
+                self.assertTrue(any('message: Hello world' in line for line in lines1))
+
+                # Verify second output file was generated
+                output2_path = os.path.join(self.directories, "output2.yaml")
+                self.assertTrue(os.path.exists(output2_path))
+                with open(output2_path, "r") as f:
+                    content2 = f.read()
+                lines2 = content2.split('\n')
+                self.assertTrue(any('message: Hi there' in line for line in lines2))
+                
+            finally:
+                loop.close()
+
+    def test_setup_multiple_serialized_outputs_different_templates(self):
+        with suppress_logs():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Create first template file
+                template1_path = os.path.join(self.directories, "template1.template")
+                with open(template1_path, "w") as f:
+                    f.write("message1: ${variables['greeting']} ${variables['name']}")
+
+                # Create second template file
+                template2_path = os.path.join(self.directories, "template2.template")
+                with open(template2_path, "w") as f:
+                    f.write("message2: ${variables['title']} ${variables['person']}")
+
+                # Create serialized config file with multiple outputs using different templates
+                serialize_path = os.path.join(self.directories, "multiple_templates.yaml.serialize")
+                serialize_content = """
+template: template1.template
+outputs:
+  - filename: output1.yaml
+    variables:
+      greeting: Hello
+      name: world
+  - filename: output2.yaml
+    template: template2.template
+    variables:
+      title: Mr
+      person: Smith
+"""
+                with open(serialize_path, "w") as f:
+                    f.write(serialize_content)
+
+                # Configure and run setup
+                self.config["overwrite_modified_files"] = True
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+
+                # Verify first output file was generated using template1
+                output1_path = os.path.join(self.directories, "output1.yaml")
+                self.assertTrue(os.path.exists(output1_path))
+                with open(output1_path, "r") as f:
+                    content1 = f.read()
+                lines1 = content1.split('\n')
+                self.assertTrue(any('message1: Hello world' in line for line in lines1))
+
+                # Verify second output file was generated using template2
+                output2_path = os.path.join(self.directories, "output2.yaml")
+                self.assertTrue(os.path.exists(output2_path))
+                with open(output2_path, "r") as f:
+                    content2 = f.read()
+                lines2 = content2.split('\n')
+                self.assertTrue(any('message2: Mr Smith' in line for line in lines2))
+                
+            finally:
+                loop.close()
+
+    def test_no_serialize_with_missing_variables(self):
+        with suppress_logs() as log_stream:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Create template file that uses undefined variable
+                template_path = os.path.join(self.directories, "test.template")
+                with open(template_path, "w") as f:
+                    f.write("message: ${variables['test']}")
+
+                # Create serialized config file
+                serialize_path = os.path.join(self.directories, "test.yaml.serialize")
+                serialize_content = """
+template: test.template
+outputs:
+  - filename: output.yaml
+    variables:
+      other: value
+"""
+                with open(serialize_path, "w") as f:
+                    f.write(serialize_content)
+
+                # Configure and run setup
+                self.config["overwrite_modified_files"] = True
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+
+                # Verify output file was not created
+                output_path = os.path.join(self.directories, "output.yaml")
+                self.assertFalse(os.path.exists(output_path))
+                
+                # Verify error was logged
+                log_output = log_stream.getvalue()
+                self.assertIn("MAKO-006 ❌ Error processing", log_output)
+                self.assertIn("KeyError: 'test'", log_output)
+                
+            finally:
+                loop.close()
+
+    def test_partial_serialize_with_corrupted_output(self):
+        with suppress_logs() as log_stream:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Create template file
+                template_path = os.path.join(self.directories, "test.template")
+                with open(template_path, "w") as f:
+                    f.write("message: ${variables['text']}")
+
+                # Create serialized config file with one corrupted output
+                serialize_path = os.path.join(self.directories, "test.yaml.serialize")
+                serialize_content = """
+template: test.template
+outputs:
+  - filename: output1.yaml
+    variables:
+      missing: value
+  - filename: output2.yaml
+    variables:
+      text: successful
+"""
+                with open(serialize_path, "w") as f:
+                    f.write(serialize_content)
+
+                # Configure and run setup
+                self.config["overwrite_modified_files"] = True
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+
+                # Verify first output file was not created due to error
+                output1_path = os.path.join(self.directories, "output1.yaml")
+                self.assertFalse(os.path.exists(output1_path))
+
+                # Verify second output file was generated successfully
+                output2_path = os.path.join(self.directories, "output2.yaml")
+                self.assertTrue(os.path.exists(output2_path))
+                with open(output2_path, "r") as f:
+                    content = f.read()
+                lines = content.split('\n')
+                self.assertTrue(any('message: successful' in line for line in lines))
+
+                # Verify error was logged for first output
+                log_output = log_stream.getvalue()
+                self.assertIn("MAKO-006 ❌ Error processing", log_output)
+                self.assertIn("KeyError: 'text'", log_output)
+                
+            finally:
+                loop.close()
+
+    def test_serialize_creates_output_directory(self):
+        with suppress_logs() as log_stream:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Create template file
+                template_path = os.path.join(self.directories, "test.template")
+                with open(template_path, "w") as f:
+                    f.write("message: ${variables['text']}")
+
+                # Create serialized config file with output to non-existent directory
+                serialize_path = os.path.join(self.directories, "test.yaml.serialize")
+                nonexistent_dir = os.path.join(self.directories, "subdir1")
+                serialize_content = f"""
+template: test.template
+outputs:
+  - filename: "subdir1/output.yaml"
+    variables:
+      text: hello from nested directory
+"""
+                with open(serialize_path, "w") as f:
+                    f.write(serialize_content)
+
+                # Verify directory doesn't exist yet
+                self.assertFalse(os.path.exists(nonexistent_dir))
+
+                # Configure and run setup
+                self.config["overwrite_modified_files"] = True
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+
+                # Verify directory was NOT created
+                self.assertFalse(os.path.exists(nonexistent_dir))
+                
+            finally:
+                loop.close()
+
+    def test_hot_reload_regenerates_after_delay(self):
+        with suppress_logs() as log_stream:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Initial content
+                with open(self.test_mako_file, "w") as f:
+                    f.write("initial: value")
+
+                # Enable hot reload with 1 second delay
+                self.config["hot_reload"] = True
+                self.config["hot_reload_delay_secs"] = 1
+                self.config["reload_wait_min_secs"] = 1
+                self.config["reload_wait_max_secs"] = 5
+                self.config["overwrite_modified_files"] = True
+                self.config["reload_behavior"] = "reload_all"
+
+                # Initial setup
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+
+                # Store initial yaml content and timestamp
+                initial_yaml_mtime = os.path.getmtime(self.test_output_file)
+                with open(self.test_output_file, "r") as f:
+                    initial_content = f.read()
+
+                # Modify mako file
+                with open(self.test_mako_file, "w") as f:
+                    f.write("modified: content")
+
+                # Wait less than delay - file should not be regenerated yet
+                loop.run_until_complete(asyncio.sleep(0.5))
+                self.assertEqual(os.path.getmtime(self.test_output_file), initial_yaml_mtime)
+                
+                # Wait for hot reload delay
+                loop.run_until_complete(asyncio.sleep(1.8))  # Total 1.2s > delay of 1s
+
+                # Verify file was regenerated
+                self.assertGreater(os.path.getmtime(self.test_output_file), initial_yaml_mtime)
+                with open(self.test_output_file, "r") as f:
+                    new_content = f.read()
+                self.assertNotEqual(new_content, initial_content)
+                self._validate_template_output("modified: content")
+                
+                # Verify Home Assistant reload was called
+                self.hass.services.call.assert_called_once_with("homeassistant", "reload_all")
+
+            finally:
+                loop.close()
+
+    def test_hot_reload_multiple_edits_within_delay(self):
+        with suppress_logs() as log_stream:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Initial content
+                with open(self.test_mako_file, "w") as f:
+                    f.write("initial: value")
+
+                # Enable hot reload with 1 second delay
+                self.config["hot_reload"] = True
+                self.config["reload_wait_min_secs"] = 1  # No minimum wait
+                self.config["reload_wait_max_secs"] = 5
+                self.config["overwrite_modified_files"] = True
+                self.config["reload_behavior"] = "reload_all"
+
+                # Initial setup
+                setup(self.hass, { DOMAIN: self.config })
+                loop.run_until_complete(asyncio.sleep(0.1))
+
+                # Store initial yaml timestamp
+                initial_yaml_mtime = os.path.getmtime(self.test_output_file)
+
+                # First edit at t=0
+                with open(self.test_mako_file, "w") as f:
+                    f.write("edit1: first change")
+                first_edit_time = time.time()
+
+                # Second edit at t=200ms
+                loop.run_until_complete(asyncio.sleep(0.2))
+                with open(self.test_mako_file, "w") as f:
+                    f.write("edit2: second change")
+
+                # Third edit at t=500ms
+                loop.run_until_complete(asyncio.sleep(0.3))
+                with open(self.test_mako_file, "w") as f:
+                    f.write("edit3: final change")
+
+                # Check at t=1s that file hasn't been regenerated yet
+                loop.run_until_complete(asyncio.sleep(0.5))  # Total 1.0s
+                self.assertEqual(os.path.getmtime(self.test_output_file), initial_yaml_mtime)
+
+                # Wait until t=1.5s
+                loop.run_until_complete(asyncio.sleep(0.6))  # Total 1.5s
+
+                # Verify file was regenerated exactly once with final content
+                final_yaml_mtime = os.path.getmtime(self.test_output_file)
+                self.assertGreater(final_yaml_mtime, initial_yaml_mtime)
+                
+                with open(self.test_output_file, "r") as f:
+                    content = f.read()
+                self._validate_template_output("edit3: final change")
+
+                # Verify the delay was measured from the first edit
+                self.assertGreaterEqual(final_yaml_mtime - first_edit_time, 1.0)
+                self.assertLess(final_yaml_mtime - first_edit_time, 1.6)  # Some buffer for test execution
+
+                # Verify Home Assistant reload was called exactly once
+                self.hass.services.call.assert_called_once_with("homeassistant", "reload_all")
+
+            finally:
+                loop.close()
 
 if __name__ == "__main__":
-    unittest.main()
+    runner = unittest.TextTestRunner()
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestSetup)
+    result = runner.run(suite)
+    print(TestSetup.timer.getReport())

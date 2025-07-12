@@ -1,20 +1,36 @@
 import json
 import os
+import threading
+
 DOMAIN = "mako_preprocessor"
 
 class RunConfig:
+    _instance = None
+    _lock = threading.Lock()
+    
     DEFAULT_VALUES = {
         "hot_reload": True,
         "hot_reload_delay_secs": 30,
         "run_on_start_ha": True,
-        "reload_frequency_secs": 5,
+        "reload_wait_min_secs": 1,
         "batch_size": 50,
         "hot_reload_extensions": [".yaml"],
         "backup_enabled": False,
         "backup_directory": "/backup"
     }
     
-    def __init__(self, hass, **kwargs):
+    def __new__(cls, hass=None, **kwargs):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    if hass is not None:
+                        cls._instance._initialize(hass, **kwargs)
+        elif hass is not None:
+            cls._instance._initialize(hass, **kwargs)
+        return cls._instance
+
+    def _initialize(self, hass, **kwargs):
         self.hass = hass
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -37,10 +53,10 @@ class RunConfig:
             "reload_behavior": config["reload_behavior"],
             "constants": config.get("constants", {})
         }
-
+        
         for key, default in RunConfig.DEFAULT_VALUES.items():
             params[key] = config.get(key, default)
-            
+
         return RunConfig(hass, **params)
 
     def is_template_disabled(self):
