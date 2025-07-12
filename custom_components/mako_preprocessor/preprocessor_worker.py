@@ -6,10 +6,8 @@ from queue import Queue, Empty
 import time
 from .template_renderer import TemplateRenderer
 from .reload_worker import ReloadWorker
-from .utils import ThreadSafeSet
+from .utils import ThreadSafeSet, get_logger
 import traceback
-
-_LOGGER = logging.getLogger(__name__)
 
 class PreprocessorWorker:
     _instance = None
@@ -21,11 +19,12 @@ class PreprocessorWorker:
         @classmethod
         @contextlib.contextmanager
         def acquire(cls):
-            _LOGGER.debug("Acquiring locks")
+            _logger = get_logger("PreprocessorWorker.Lock")
+            _logger.debug("Acquiring locks")
             with cls._thread_lock:
-                _LOGGER.debug("Acquired thread lock")
+                _logger.debug("Acquired thread lock")
                 yield
-            _LOGGER.debug("Released thread lock")
+            _logger.debug("Released thread lock")
 
     def __new__(cls, run_config=None):
         if cls._instance is None:
@@ -38,7 +37,8 @@ class PreprocessorWorker:
         return cls._instance
 
     def _initialize(self, run_config):
-        _LOGGER.debug("Initializing PreprocessorWorker")
+        self._logger = get_logger(type(self))
+        self._logger.debug("Initializing PreprocessorWorker")
         self.run_config = run_config
         self.template_renderer = TemplateRenderer(run_config)
         self.render_queue = Queue()
@@ -52,7 +52,7 @@ class PreprocessorWorker:
         self.worker_thread.start()
 
     def add_file(self, file_path, from_hot_reload=False):
-        _LOGGER.debug(f"Add file to queue: {file_path}, from_hot_reload: {from_hot_reload}")
+        self._logger.debug(f"Add file to queue: {file_path}, from_hot_reload: {from_hot_reload}")
         if file_path in self.queued_files or (from_hot_reload and file_path in self.scheduled_files):
             return
         
@@ -60,12 +60,12 @@ class PreprocessorWorker:
         self.render_queue.put((file_path, from_hot_reload))
 
     def add_files(self, files):
-        _LOGGER.debug(f"Add multiple files to queue: {files}")
+        self._logger.debug(f"Add multiple files to queue: {files}")
         for file_path in files:
             self.add_file(file_path)
 
     def _should_process_file(self, file_path, from_hot_reload):
-        _LOGGER.debug(f"Checking if file should be processed: {file_path}, from_hot_reload: {from_hot_reload}")
+        self._logger.debug(f"Checking if file should be processed: {file_path}, from_hot_reload: {from_hot_reload}")
         
         if not os.path.exists(file_path) or not from_hot_reload:
             return {"should_process": True, "retry_after": None}
@@ -87,7 +87,7 @@ class PreprocessorWorker:
             return {"should_process": True, "retry_after": None}
             
         except OSError:
-            _LOGGER.error(f"MAKO-014 Error checking file {file_path}: {traceback.format_exc()}")
+            self._logger.error(f"MAKO-014 Error checking file {file_path}: {traceback.format_exc()}")
             return {"should_process": False, "retry_after": None}
 
     def _schedule_retry(self, file_path, retry_after, from_hot_reload):
@@ -122,14 +122,14 @@ class PreprocessorWorker:
         return batch_files
 
     def _process_queue(self):
-        _LOGGER.debug("Starting to process queue")
+        self._logger.debug("Starting to process queue")
         while not self.stop_event.is_set():
             try:
                 batch_files = None
-                _LOGGER.debug(f"Checking queue {self.render_queue.qsize()}")
+                self._logger.debug(f"Checking queue {self.render_queue.qsize()}")
                 file_path, from_hot_reload = self.render_queue.get(timeout=1)
                 batch_files = self._collect_batch_files(file_path, from_hot_reload)
-                _LOGGER.debug(f"Collected batch of files: {len(batch_files)}")
+                self._logger.debug(f"Collected batch of files: {len(batch_files)}")
                 if batch_files:
                     with self.Lock.acquire():
                         self.template_renderer.process_batch(list(batch_files))
@@ -141,21 +141,21 @@ class PreprocessorWorker:
             except Empty:
                 continue
             except Exception as e:
-                _LOGGER.error(f"MAKO-015 Error in preprocessor worker: {e}\n{traceback.format_exc()}")
+                self._logger.error(f"MAKO-015 Error in preprocessor worker: {e}\n{traceback.format_exc()}")
                 continue
 
     def schedule_hot_reload(self, file_path):
-        _LOGGER.debug(f"Scheduling hot reload: {file_path}")
+        self._logger.debug(f"Scheduling hot reload: {file_path}")
         if file_path in self.scheduled_files:
             return
         
         self._schedule_retry(file_path, self.run_config.hot_reload_delay_secs, from_hot_reload=True)
 
     def _reschedule_file(self, file_path, from_hot_reload):
-        _LOGGER.debug(f"Rescheduling file: {file_path}, from_hot_reload: {from_hot_reload}")
+        self._logger.debug(f"Rescheduling file: {file_path}, from_hot_reload: {from_hot_reload}")
         self.scheduled_files.remove(file_path)
         self.add_file(file_path, from_hot_reload)
 
     def stop(self):
-        _LOGGER.debug("Stopping PreprocessorWorker")
+        self._logger.debug("Stopping PreprocessorWorker")
         self.stop_event.set()

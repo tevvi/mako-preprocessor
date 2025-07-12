@@ -5,10 +5,8 @@ import threading
 from .metadata import MetadataManager
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from .utils import FileMatcher
+from .utils import FileMatcher, get_logger
 from .preprocessor_worker import PreprocessorWorker
-
-_LOGGER = logging.getLogger(__name__)
 
 class HotReloadWorker:
     _instance = None
@@ -25,6 +23,7 @@ class HotReloadWorker:
         return cls._instance
 
     def _initialize(self, run_config):
+        self._logger = get_logger(type(self))
         self.run_config = run_config
         self.observer = None
         self.metadata = MetadataManager()
@@ -36,6 +35,7 @@ class HotReloadWorker:
     class FileChangeHandler(FileSystemEventHandler):
         def __init__(self, worker: 'HotReloadWorker'):
             self.worker = worker
+            self._logger = get_logger("HotReloadWorker.FileChangeHandler")
 
         def _handle_event(self, event, src_path):
             if event.is_directory:
@@ -49,19 +49,24 @@ class HotReloadWorker:
                     self.worker.preprocessor.schedule_hot_reload(src_path)
 
         def on_modified(self, event):
+            self._logger.debug(f"File modified: {event.src_path}")
             self._handle_event(event, event.src_path)
 
         def on_created(self, event):
+            self._logger.debug(f"File created: {event.src_path}")
             self._handle_event(event, event.src_path)
 
         def on_deleted(self, event):
+            self._logger.debug(f"File deleted: {event.src_path}")
             self._handle_event(event, event.src_path)
 
         def on_moved(self, event):
+            self._logger.debug(f"File moved: {event.src_path} -> {event.dest_path}")
             self._handle_event(event, event.src_path)
             self._handle_event(event, event.dest_path)
 
     def _start_monitoring(self):
+        self._logger.debug("Starting directory monitoring")
         self.observer = Observer()
         handler = self.FileChangeHandler(self)
         for directory in self.run_config.directories:
@@ -78,4 +83,5 @@ class HotReloadWorker:
 
     def stop(self):
         if not self.stop_event.is_set():
+            self._logger.debug("Stopping HotReloadWorker")
             self.stop_event.set()

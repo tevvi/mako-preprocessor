@@ -3,8 +3,9 @@ import json
 import logging
 import threading
 import contextlib
+from datetime import datetime
+from .utils import get_logger
 
-_LOGGER = logging.getLogger(__name__)
 META_FILE = ".mako_meta.json"
 
 class MetadataManager:
@@ -21,7 +22,8 @@ class MetadataManager:
         return cls._instance
 
     def _initialize(self):
-        _LOGGER.debug("Initializing MetadataManager")
+        self._logger = get_logger(type(self))
+        self._logger.debug("Initializing MetadataManager")
         self._data = {}
         self._batch_active = 0
         self._batch_changed = False
@@ -33,15 +35,15 @@ class MetadataManager:
             try:
                 with open(META_FILE, "r", encoding="utf-8") as f:
                     self._data = json.load(f)
-                    _LOGGER.debug("Metadata loaded successfully")
+                    self._logger.debug("Metadata loaded successfully")
             except json.JSONDecodeError:
-                _LOGGER.warning("⚠️ Metadata file is corrupted. Creating a new one.")
+                self._logger.warning("⚠️ Metadata file is corrupted. Creating a new one.")
                 self._data = {}
 
     def _migrate(self):
         version = self._data.get("metadata_version")
         if version != self.CURRENT_VERSION:
-            _LOGGER.info(f"Migrating metadata from version {version} to {self.CURRENT_VERSION}")
+            self._logger.info(f"Migrating metadata from version {version} to {self.CURRENT_VERSION}")
             # TODO: migration logic here
             self._data["metadata_version"] = self.CURRENT_VERSION
             self.save()
@@ -50,15 +52,15 @@ class MetadataManager:
         with self._lock:
             with open(META_FILE, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2)
-                _LOGGER.debug("Metadata saved successfully")
+                self._logger.debug("Metadata saved successfully")
 
     def get(self, key, default=None):
         value = self._data.get(key, default)
-        _LOGGER.debug(f"Getting key: {key}, value: {value}")
+        self._logger.debug(f"Getting key: {key}, value: {value}")
         return value
 
     def set(self, key, value):
-        _LOGGER.debug(f"Setting key: {key}, value: {value}")
+        self._logger.debug(f"Setting key: {key}, value: {value}")
         with self._lock:
             self._data[key] = value
             if self._batch_active == 0:
@@ -67,7 +69,7 @@ class MetadataManager:
                 self._batch_changed = True
 
     def update(self, new_data):
-        _LOGGER.debug(f"Updating data: {new_data}")
+        self._logger.debug(f"Updating data: {new_data}")
         with self._lock:
             self._data.update(new_data)
             if self._batch_active == 0:
@@ -77,19 +79,19 @@ class MetadataManager:
 
     @property
     def data(self):
-        _LOGGER.debug("Getting a copy of all data")
+        self._logger.debug("Getting a copy of all data")
         return self._data.copy()
 
     def clear_all(self):
         self._data.clear()
         self._data["metadata_version"] = self.CURRENT_VERSION
         self.save()
-        _LOGGER.debug("All metadata cleared")
+        self._logger.debug("All metadata cleared")
 
     @contextlib.contextmanager
     def batch_update(self):
         self._batch_active += 1
-        _LOGGER.debug(f"Starting batch update, level: {self._batch_active}")
+        self._logger.debug(f"Starting batch update, level: {self._batch_active}")
         try:
             yield
         finally:
@@ -97,7 +99,7 @@ class MetadataManager:
             if self._batch_active == 0 and self._batch_changed:
                 self.save()
                 self._batch_changed = False
-            _LOGGER.debug(f"Batch update finished, level: {self._batch_active}")
+            self._logger.debug(f"Batch update finished, level: {self._batch_active}")
 
     @property
     def version(self):

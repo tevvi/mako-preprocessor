@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+from .utils import get_logger
 
 DOMAIN = "mako_preprocessor"
 
@@ -31,6 +32,7 @@ class RunConfig:
         return cls._instance
 
     def _initialize(self, hass, **kwargs):
+        self._logger = get_logger(type(self))
         self.hass = hass
         for key, value in kwargs.items():
             setattr(self, key, value)

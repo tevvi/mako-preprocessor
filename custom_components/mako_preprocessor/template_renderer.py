@@ -5,13 +5,12 @@ import shutil
 from mako.template import Template
 from mako.lookup import TemplateLookup
 from .run_config import DOMAIN
-from .utils import FileMatcher, SerializedParser
+from .utils import FileMatcher, SerializedParser, get_logger
 from .metadata import MetadataManager
 from datetime import datetime, UTC
 
-_LOGGER = logging.getLogger(__name__)
-
 class TemplateRenderer:
+    _logger = get_logger("TemplateRenderer")
     class TrackingUrisLookup(TemplateLookup):
         def __init__(self, *args, **kwargs):
             self.requested_uris = set()
@@ -27,7 +26,8 @@ class TemplateRenderer:
             return uris
 
     def __init__(self, run_config):
-        _LOGGER.debug("Initializing TemplateRenderer")
+        self._logger = get_logger(type(self))
+        self._logger.debug("Initializing TemplateRenderer")
         self._batch_active = 0
         if not run_config.is_template_disabled():
             self.lookup = self.TrackingUrisLookup(directories=run_config.directories, input_encoding='utf-8', output_encoding='utf-8')
@@ -47,10 +47,10 @@ class TemplateRenderer:
         timestamp = datetime.fromtimestamp(os.path.getmtime(file_path), UTC).strftime('%Y%m%d%H%M%S')
         backup_path = os.path.join(backup_dir, f"{timestamp}_{os.path.basename(file_path)}")
         shutil.move(file_path, backup_path)
-        _LOGGER.debug(f"📦 Backup created: {backup_path}")
+        self._logger.debug(f"📦 Backup created: {backup_path}")
 
     def _change_file_allowed(self, output_path):
-        _LOGGER.debug(f"Checking if file change is allowed: {output_path}")
+        self._logger.debug(f"Checking if file change is allowed: {output_path}")
         if not os.path.exists(output_path):
             return { "allowed": True, "user_changed": False }
         
@@ -58,10 +58,10 @@ class TemplateRenderer:
         last_saved = self.metadata.get(output_path)
         if last_saved is None:
             if self.run_config.overwrite_modified_files:
-                _LOGGER.warning(f"MAKO-004 ⚠️ File {output_path} was manually modified, but overwriting due to setting.")
+                self._logger.warning(f"MAKO-004 ⚠️ File {output_path} was manually modified, but overwriting due to setting.")
                 return { "allowed": True, "user_changed": True }
             
-            _LOGGER.error(f"MAKO-005 ❌ File {output_path} was manually modified! Not overwriting.")
+            self._logger.error(f"MAKO-005 ❌ File {output_path} was manually modified! Not overwriting.")
             return { "allowed": False, "user_changed": True }
 
         last_modified = os.path.getmtime(output_path)
@@ -69,10 +69,10 @@ class TemplateRenderer:
             return { "allowed": True, "user_changed": False }
         
         if self.run_config.overwrite_modified_files:
-            _LOGGER.warning(f"MAKO-004 ⚠️ File {output_path} was manually modified, but overwriting due to setting.")
+            self._logger.warning(f"MAKO-004 ⚠️ File {output_path} was manually modified, but overwriting due to setting.")
             return { "allowed": True, "user_changed": True }
         
-        _LOGGER.error(f"MAKO-005 ❌ File {output_path} was manually modified! Not overwriting.")
+        self._logger.error(f"MAKO-005 ❌ File {output_path} was manually modified! Not overwriting.")
         return { "allowed": False, "user_changed": True }
 
     def format_output(self, rendered_output, template_path, output_path, variables):
@@ -94,7 +94,7 @@ class TemplateRenderer:
         return f"{prefix}{rendered_output}{postfix}"
 
     def _render(self, template_path, output_path, **variables):
-        _LOGGER.debug(f"Rendering template: {template_path} to {output_path}")
+        self._logger.debug(f"Rendering template: {template_path} to {output_path}")
         dependencies = []
         check = self._change_file_allowed(output_path)
         if not check["allowed"]:
@@ -111,10 +111,10 @@ class TemplateRenderer:
                 f.write(final_output)
             self.metadata.set(output_path, os.path.getmtime(output_path))
             
-            _LOGGER.info(f"✅ {template_path} -> {output_path}")
+            self._logger.info(f"✅ {template_path} -> {output_path}")
             return { "success": True, "dependencies": dependencies }
         except Exception as e:
-            _LOGGER.error(f"MAKO-006 ❌ Error processing {template_path}: {e}\n{traceback.format_exc()}")
+            self._logger.error(f"MAKO-006 ❌ Error processing {template_path}: {e}\n{traceback.format_exc()}")
             return { "success": False, "dependencies": dependencies }
 
     def _remove_outdated_files(self, current_generated_files, previous_generated_files):
@@ -122,27 +122,27 @@ class TemplateRenderer:
             if file not in current_generated_files:
                 check = self._change_file_allowed(file)
                 if not check["allowed"]:
-                    _LOGGER.warning(f"MAKO-016 ⚠️ Outdated file {file} was manually modified and will not be removed.")
+                    self._logger.warning(f"MAKO-016 ⚠️ Outdated file {file} was manually modified and will not be removed.")
                     continue
                 try:
                     if check["user_changed"]:
                         self._backup_file(file)
                         
                     os.remove(file)
-                    _LOGGER.info(f"🗑️ Removed outdated file: {file}")
+                    self._logger.info(f"🗑️ Removed outdated file: {file}")
                 except OSError as e:
-                    _LOGGER.error(f"MAKO-017 ❌ Error removing outdated file {file}: {e}")
+                    self._logger.error(f"MAKO-017 ❌ Error removing outdated file {file}: {e}")
 
     def _render_serialize(self, serialize_file_path, matched_ext):
-        _LOGGER.debug(f"Rendering serialize file: {serialize_file_path}")
+        self._logger.debug(f"Rendering serialize file: {serialize_file_path}")
         parsed_data = SerializedParser.parse(serialize_file_path, matched_ext, self.run_config.constants)
         if not parsed_data:
-            _LOGGER.error(f"MAKO-007 ❌ Failed to get data from {serialize_file_path}.")
+            self._logger.error(f"MAKO-007 ❌ Failed to get data from {serialize_file_path}.")
             return
 
         outputs = parsed_data.get("outputs")
         if not outputs:
-            _LOGGER.error(f"MAKO-008 ❌ File {serialize_file_path} must contain 'outputs' key.")
+            self._logger.error(f"MAKO-008 ❌ File {serialize_file_path} must contain 'outputs' key.")
             return
 
         default_template = parsed_data.get("template")
@@ -159,7 +159,7 @@ class TemplateRenderer:
 
             tmpl = output.get("template", default_template)
             if not tmpl:
-                _LOGGER.error(
+                self._logger.error(
                     f"MAKO-009 ❌ No template specified for file {serialize_file_path} either by default or in output. Skipping output {output}."
                 )
                 continue
@@ -170,7 +170,7 @@ class TemplateRenderer:
             template_path = os.path.join(base_dir, tmpl)
             dependencies.add(template_path)
             if not os.path.exists(template_path):
-                _LOGGER.error(
+                self._logger.error(
                     f"MAKO-010 ❌ Template {template_path} not found for file {serialize_file_path}. Skipping output {output}."
                 )
                 continue
@@ -188,13 +188,13 @@ class TemplateRenderer:
         self.metadata.set_generated_files(serialize_file_path, generated_files)
 
     def _process_file(self, file_path):
-        _LOGGER.debug(f"Processing file: {file_path}")
+        self._logger.debug(f"Processing file: {file_path}")
         if file_path in self._rendered_files:
-            _LOGGER.debug(f"File {file_path} already rendered in this batch. Skipping.")
+            self._logger.debug(f"File {file_path} already rendered in this batch. Skipping.")
             return True
 
         if not os.path.exists(file_path):
-            _LOGGER.debug(f"File {file_path} does not exist. Removing metadata.")
+            self._logger.debug(f"File {file_path} does not exist. Removing metadata.")
             self.metadata.remove_file_metadata(file_path)
             return True
         
@@ -221,11 +221,11 @@ class TemplateRenderer:
                 self._rendered_files.add(file_path)
             return False
         except Exception as e:
-            _LOGGER.error(f"MAKO-011 ❌ Error processing {file_path}: {e}\n{traceback.format_exc()}")
+            self._logger.error(f"MAKO-011 ❌ Error processing {file_path}: {e}\n{traceback.format_exc()}")
             return False
 
     def _process_file_and_deps(self, file_path):
-        _LOGGER.debug(f"Processing file and dependencies: {file_path}")
+        self._logger.debug(f"Processing file and dependencies: {file_path}")
         dependents = self.metadata.get_dependents(file_path)
         if not dependents:
             return self._process_file(file_path)
@@ -234,7 +234,7 @@ class TemplateRenderer:
             self._process_file(dep)
 
     def process_batch(self, files):
-        _LOGGER.debug(f"Processing batch of files: {files}")
+        self._logger.debug(f"Processing batch of files: {files}")
         self._batch_active += 1
         try:
             with self.metadata.batch_update():
@@ -244,4 +244,4 @@ class TemplateRenderer:
             self._batch_active -= 1
             if self._batch_active == 0 and self._rendered_files:
                 self._rendered_files.clear()
-            _LOGGER.debug(f"Batch update finished, level: {self._batch_active}")
+            self._logger.debug(f"Batch update finished, level: {self._batch_active}")
